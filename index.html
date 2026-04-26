@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Alphabet Game</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #fafafa; font-family: system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4vh; }
+  #word { display: flex; gap: 2vw; }
+  .letter {
+    font-size: 22vh;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: #bbb;
+    transition: color 0.2s, transform 0.2s;
+  }
+  .letter.current { color: #1976d2; transform: scale(1.15); }
+  .letter.done { color: #2e7d32; }
+  #status { font-size: 3vh; color: #555; min-height: 4vh; text-align: center; padding: 0 2vw; }
+  #heard { font-size: 2vh; color: #888; min-height: 3vh; font-style: italic; }
+  #controls { display: flex; gap: 1vw; }
+  button {
+    font-size: 2.5vh; padding: 1vh 3vw; border: none; border-radius: 1vh;
+    background: #1976d2; color: white; cursor: pointer;
+  }
+  button.secondary { background: #888; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  #reward { font-size: 12vh; min-height: 14vh; }
+  #progress { position: fixed; top: 1vh; right: 2vw; font-size: 1.8vh; color: #999; }
+</style>
+</head>
+<body>
+
+<div id="progress"></div>
+<div id="reward"></div>
+<div id="word"></div>
+<div id="status">Press Start and say each letter</div>
+<div id="heard"></div>
+<div id="controls">
+  <button id="startBtn">Start</button>
+  <button id="nextBtn" class="secondary">New Word</button>
+  <button id="skipBtn" class="secondary">Skip Letter</button>
+</div>
+
+<script>
+// ---- Word list: scaffolded by vowel sound ----
+// 3-letter short vowels first, then 4-letter long vowels & diphthongs.
+// Similar vowel sounds are adjacent.
+const WORDS = [
+  // short a
+  "cat","bat","hat","map","cap","bag","ham","jam","ran","dad","van","fan",
+  // long a (silent e)
+  "cake","lake","gate","name","game",
+  // long a (ai/ay)
+  "rain","mail","tail","pain","tray",
+  // short e
+  "bed","red","hen","pen","ten","leg","web","jet","yes","get",
+  // long e (ee)
+  "feet","tree","seed","beep","peek",
+  // long e (ea)
+  "leaf","read","beam","team","meat",
+  // short i
+  "pig","big","sit","hit","pin","win","tip","kid","lip","fix",
+  // long i (silent e)
+  "bike","kite","time","ride","hide",
+  // short o
+  "dog","log","hot","pot","top","box","fox","hop","mom","mop",
+  // long o (silent e)
+  "bone","home","rope","nose","joke",
+  // long o (oa)
+  "boat","road","soap","coat","goat",
+  // short u
+  "cup","sun","run","bus","mud","hug","bug","nut",
+  // long u (oo)
+  "moon","food","room","pool","boot",
+  // diphthong oi/oy
+  "coin","boil","join","toys","soil",
+  // diphthong ow/ou
+  "down","town","loud","gown","foul",
+];
+
+// ---- Phonetic letter map ----
+// Tokens the speech recognizer may return → which letter they mean.
+const LETTER_TOKENS = {
+  a: ["a","ay","eh","aye"],
+  b: ["b","be","bee","bea","b."],
+  c: ["c","see","sea","cee","si"],
+  d: ["d","de","dee","the"],
+  e: ["e","ee","eee","eh"],
+  f: ["f","ef","eff"],
+  g: ["g","gee","jee"],
+  h: ["h","aitch","haitch","hatch","ache"],
+  i: ["i","eye","aye","i."],
+  j: ["j","jay","jai"],
+  k: ["k","kay","okay","ok"],
+  l: ["l","el","ell"],
+  m: ["m","em","mm"],
+  n: ["n","en","in","an"],
+  o: ["o","oh","owe","ow"],
+  p: ["p","pee","pea","p."],
+  q: ["q","cue","queue","kyu","kew"],
+  r: ["r","are","r.","ar"],
+  s: ["s","es","ess"],
+  t: ["t","tee","tea","te","t."],
+  u: ["u","you","ewe","yu","yew"],
+  v: ["v","vee","ve"],
+  w: ["w","double u","doubleu","double you","doubleyou","dub"],
+  x: ["x","ex","eks","ax","axe"],
+  y: ["y","why","wye"],
+  z: ["z","zee","zed"],
+};
+
+// Build reverse lookup: token → letter
+const TOKEN_TO_LETTER = {};
+for (const [letter, tokens] of Object.entries(LETTER_TOKENS)) {
+  for (const t of tokens) TOKEN_TO_LETTER[t.toLowerCase()] = letter;
+  TOKEN_TO_LETTER[letter] = letter; // single-char fallback
+}
+
+// ---- DOM ----
+const wordEl = document.getElementById("word");
+const statusEl = document.getElementById("status");
+const heardEl = document.getElementById("heard");
+const rewardEl = document.getElementById("reward");
+const progressEl = document.getElementById("progress");
+const startBtn = document.getElementById("startBtn");
+const nextBtn = document.getElementById("nextBtn");
+const skipBtn = document.getElementById("skipBtn");
+
+let currentWord = "";
+let currentIdx = 0;
+let recognition = null;
+let listening = false;
+let usedWords = new Set();
+
+function pickWord() {
+  if (usedWords.size >= WORDS.length) usedWords.clear();
+  // Pick from earliest unused chunk to maintain scaffolding bias
+  const candidates = WORDS.filter(w => !usedWords.has(w));
+  // Bias toward earlier (simpler) words: pick from first 20% of remaining
+  const slice = candidates.slice(0, Math.max(5, Math.ceil(candidates.length * 0.3)));
+  const w = slice[Math.floor(Math.random() * slice.length)];
+  usedWords.add(w);
+  return w;
+}
+
+function renderWord() {
+  wordEl.innerHTML = "";
+  for (let i = 0; i < currentWord.length; i++) {
+    const span = document.createElement("span");
+    span.className = "letter" + (i < currentIdx ? " done" : i === currentIdx ? " current" : "");
+    span.textContent = currentWord[i];
+    wordEl.appendChild(span);
+  }
+  progressEl.textContent = `Word ${usedWords.size} / ${WORDS.length}`;
+}
+
+function newWord() {
+  currentWord = pickWord();
+  currentIdx = 0;
+  rewardEl.textContent = "";
+  statusEl.textContent = `Say the letters: ${currentWord.toUpperCase().split("").join(" ")}`;
+  heardEl.textContent = "";
+  renderWord();
+}
+
+function reward() {
+  const emojis = ["⭐","🎉","🌟","🏆","🎊","💖","🦄","🌈"];
+  rewardEl.textContent = emojis[Math.floor(Math.random() * emojis.length)].repeat(3);
+  statusEl.textContent = `Great job! You spelled ${currentWord.toUpperCase()}!`;
+  setTimeout(newWord, 2500);
+}
+
+function processTranscript(text) {
+  heardEl.textContent = `Heard: "${text}"`;
+  // Normalize: lowercase, replace punctuation with spaces, collapse spaces
+  const cleaned = text.toLowerCase().replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned) return;
+
+  // Try multi-word tokens first (e.g., "double u"), then single words, then chars
+  const words = cleaned.split(" ");
+  const tokens = [];
+  for (let i = 0; i < words.length; i++) {
+    // Try 2-word combo
+    if (i + 1 < words.length) {
+      const combo = words[i] + " " + words[i + 1];
+      if (TOKEN_TO_LETTER[combo]) { tokens.push(combo); i++; continue; }
+    }
+    tokens.push(words[i]);
+  }
+
+  for (const tok of tokens) {
+    if (currentIdx >= currentWord.length) break;
+    const expected = currentWord[currentIdx];
+    let matched = null;
+
+    if (TOKEN_TO_LETTER[tok]) {
+      matched = TOKEN_TO_LETTER[tok];
+    } else if (tok.length === 1 && /[a-z]/.test(tok)) {
+      matched = tok;
+    } else if (tok.length <= 3 && TOKEN_TO_LETTER[tok[0]]) {
+      // Sometimes recognizer hears "buh" for B — fall back to first char
+      matched = tok[0];
+    }
+
+    if (matched === expected) {
+      currentIdx++;
+      renderWord();
+      if (currentIdx === currentWord.length) {
+        reward();
+        return;
+      }
+    }
+  }
+}
+
+function setupRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    statusEl.textContent = "Speech recognition not supported. Please use Chrome.";
+    startBtn.disabled = true;
+    return;
+  }
+  recognition = new SR();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
+
+  recognition.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const transcript = e.results[i][0].transcript;
+      processTranscript(transcript);
+    }
+  };
+
+  recognition.onerror = (e) => {
+    if (e.error === "no-speech" || e.error === "aborted") return;
+    statusEl.textContent = `Mic error: ${e.error}`;
+  };
+
+  recognition.onend = () => {
+    if (listening) {
+      try { recognition.start(); } catch (_) {}
+    }
+  };
+}
+
+startBtn.addEventListener("click", () => {
+  if (!recognition) setupRecognition();
+  if (!recognition) return;
+  if (!listening) {
+    listening = true;
+    try { recognition.start(); } catch (_) {}
+    startBtn.textContent = "Stop";
+    if (!currentWord) newWord();
+  } else {
+    listening = false;
+    recognition.stop();
+    startBtn.textContent = "Start";
+  }
+});
+
+nextBtn.addEventListener("click", newWord);
+skipBtn.addEventListener("click", () => {
+  if (currentIdx < currentWord.length) {
+    currentIdx++;
+    renderWord();
+    if (currentIdx === currentWord.length) reward();
+  }
+});
+
+newWord();
+</script>
+</body>
+</html>
