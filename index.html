@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Alphabet Game</title>
+<script src="https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js"></script>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; background: #fafafa; font-family: system-ui, sans-serif; }
   body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4vh; }
@@ -127,21 +128,22 @@ const startBtn = document.getElementById("startBtn");
 const nextBtn = document.getElementById("nextBtn");
 const skipBtn = document.getElementById("skipBtn");
 
-const IS_ANDROID = /Android/i.test(navigator.userAgent);
-const START_LABEL = IS_ANDROID ? "Listen" : "Start";
-const STOP_LABEL = IS_ANDROID ? "Listening…" : "Stop";
+const MODEL_URL = "models/vosk-model-small-en-us-0.15.tar.gz";
 
 let currentWord = "";
 let currentIdx = 0;
-let recognition = null;
-let listening = false;
 let usedWords = new Set();
+let listening = false;
+let voskReady = false;
+let voskLoading = false;
+let voskRecognizer = null;
+let audioCtx = null;
+let micStream = null;
 
 function setListeningUI(on) {
-  startBtn.textContent = on ? STOP_LABEL : START_LABEL;
+  startBtn.textContent = on ? "Stop" : "Start";
 }
 
-let audioCtx = null;
 function getAudioCtx() {
   if (!audioCtx) {
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -212,11 +214,6 @@ function reward() {
   rewardEl.textContent = emojis[Math.floor(Math.random() * emojis.length)].repeat(3);
   statusEl.textContent = `Great job! You spelled ${currentWord.toUpperCase()}!`;
   playFanfare();
-  if (IS_ANDROID && listening && recognition) {
-    listening = false;
-    try { recognition.stop(); } catch (_) {}
-    setListeningUI(false);
-  }
   setTimeout(newWord, 2500);
 }
 
@@ -263,68 +260,78 @@ function processTranscript(text) {
   }
 }
 
-function setupRecognition() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    statusEl.textContent = "Speech recognition not supported. Please use Chrome.";
-    startBtn.disabled = true;
-    return;
+async function initVosk() {
+  if (voskReady || voskLoading) return voskReady;
+  if (typeof Vosk === "undefined") {
+    statusEl.textContent = "Speech library failed to load. Check your connection.";
+    return false;
   }
-  recognition = new SR();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = "en-US";
+  if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorklet) {
+    statusEl.textContent = "Speech input is not supported in this browser.";
+    return false;
+  }
+  voskLoading = true;
+  startBtn.disabled = true;
+  startBtn.textContent = "Loading…";
+  statusEl.textContent = "Loading speech model (~40 MB, first time only)…";
+  try {
+    const channel = new MessageChannel();
+    const model = await Vosk.createModel(MODEL_URL);
+    model.registerPort(channel.port1);
 
-  recognition.onresult = (e) => {
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const transcript = e.results[i][0].transcript;
-      processTranscript(transcript);
-    }
-  };
+    const ctx = getAudioCtx();
+    const sampleRate = ctx.sampleRate;
+    const recognizer = new model.KaldiRecognizer(sampleRate);
+    recognizer.setWords(true);
+    recognizer.on("result", (m) => {
+      if (!listening) return;
+      processTranscript(m.result?.text || "");
+    });
+    recognizer.on("partialresult", (m) => {
+      if (!listening) return;
+      processTranscript(m.result?.partial || "");
+    });
+    voskRecognizer = recognizer;
 
-  recognition.onerror = (e) => {
-    if (e.error === "no-speech" || e.error === "aborted") return;
-    statusEl.textContent = `Mic error: ${e.error}`;
-  };
+    micStream = await navigator.mediaDevices.getUserMedia({
+      video: false,
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+    await ctx.audioWorklet.addModule("recognizer-processor.js");
+    const node = new AudioWorkletNode(ctx, "recognizer-processor", {
+      channelCount: 1, numberOfInputs: 1, numberOfOutputs: 1,
+    });
+    node.port.postMessage({ action: "init", recognizerId: recognizer.id }, [channel.port2]);
+    ctx.createMediaStreamSource(micStream).connect(node);
+    node.connect(ctx.destination);
 
-  recognition.onend = () => {
-    if (!listening) return;
-    if (IS_ANDROID) {
-      listening = false;
-      setListeningUI(false);
-      heardEl.textContent = "";
-      return;
-    }
-    try { recognition.start(); } catch (_) {}
-  };
+    voskReady = true;
+    statusEl.textContent = currentWord
+      ? `Say the letters: ${currentWord.toUpperCase().split("").join(" ")}`
+      : "Ready. Press Start.";
+    return true;
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = `Speech setup failed: ${err.message || err}`;
+    return false;
+  } finally {
+    voskLoading = false;
+    startBtn.disabled = false;
+  }
 }
 
-startBtn.addEventListener("click", () => {
-  getAudioCtx(); // unlock audio with this user gesture
-  if (!recognition) setupRecognition();
-  if (!recognition) return;
-  if (!listening) {
-    listening = true;
-    try { recognition.start(); } catch (_) {}
-    setListeningUI(true);
-    if (!currentWord) newWord();
-    if (IS_ANDROID) heardEl.textContent = "Listening…";
-  } else {
-    listening = false;
-    recognition.stop();
-    setListeningUI(false);
-    if (IS_ANDROID) heardEl.textContent = "";
+startBtn.addEventListener("click", async () => {
+  getAudioCtx();
+  if (!voskReady) {
+    const ok = await initVosk();
+    if (!ok) return;
   }
+  listening = !listening;
+  setListeningUI(listening);
+  if (listening && !currentWord) newWord();
 });
 
-nextBtn.addEventListener("click", () => {
-  if (IS_ANDROID && listening && recognition) {
-    listening = false;
-    try { recognition.stop(); } catch (_) {}
-    setListeningUI(false);
-  }
-  newWord();
-});
+nextBtn.addEventListener("click", newWord);
 skipBtn.addEventListener("click", () => {
   if (currentIdx < currentWord.length) {
     currentIdx++;
