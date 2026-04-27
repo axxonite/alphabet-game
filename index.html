@@ -260,6 +260,33 @@ function processTranscript(text) {
   }
 }
 
+async function downloadWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching model`);
+  const total = Number(res.headers.get("Content-Length")) || 0;
+  const totalMb = total ? (total / 1048576).toFixed(0) : null;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  let lastUpdate = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    const now = performance.now();
+    if (now - lastUpdate > 100) {
+      lastUpdate = now;
+      const pct = total ? Math.round((received / total) * 100) : 0;
+      const mb = (received / 1048576).toFixed(1);
+      onProgress(pct, mb, totalMb);
+    }
+  }
+  onProgress(100, (received / 1048576).toFixed(1), totalMb);
+  const blob = new Blob(chunks, { type: "application/gzip" });
+  return URL.createObjectURL(blob);
+}
+
 async function initVosk() {
   if (voskReady || voskLoading) return voskReady;
   if (typeof Vosk === "undefined") {
@@ -273,10 +300,16 @@ async function initVosk() {
   voskLoading = true;
   startBtn.disabled = true;
   startBtn.textContent = "Loading…";
-  statusEl.textContent = "Loading speech model (~40 MB, first time only)…";
+  statusEl.textContent = "Downloading speech model… 0%";
   try {
+    const modelObjectUrl = await downloadWithProgress(MODEL_URL, (pct, mb, totalMb) => {
+      statusEl.textContent = totalMb
+        ? `Downloading speech model… ${pct}% (${mb} / ${totalMb} MB)`
+        : `Downloading speech model… ${mb} MB`;
+    });
+    statusEl.textContent = "Unpacking speech model…";
     const channel = new MessageChannel();
-    const model = await Vosk.createModel(MODEL_URL);
+    const model = await Vosk.createModel(modelObjectUrl);
     model.registerPort(channel.port1);
 
     const ctx = getAudioCtx();
@@ -293,6 +326,7 @@ async function initVosk() {
     });
     voskRecognizer = recognizer;
 
+    statusEl.textContent = "Connecting microphone…";
     micStream = await navigator.mediaDevices.getUserMedia({
       video: false,
       audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
