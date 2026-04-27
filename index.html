@@ -127,11 +127,19 @@ const startBtn = document.getElementById("startBtn");
 const nextBtn = document.getElementById("nextBtn");
 const skipBtn = document.getElementById("skipBtn");
 
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+const START_LABEL = IS_MOBILE ? "Listen" : "Start";
+const STOP_LABEL = IS_MOBILE ? "Listening…" : "Stop";
+
 let currentWord = "";
 let currentIdx = 0;
 let recognition = null;
 let listening = false;
 let usedWords = new Set();
+
+function setListeningUI(on) {
+  startBtn.textContent = on ? STOP_LABEL : START_LABEL;
+}
 
 function pickWord() {
   if (usedWords.size >= WORDS.length) usedWords.clear();
@@ -168,6 +176,11 @@ function reward() {
   const emojis = ["⭐","🎉","🌟","🏆","🎊","💖","🦄","🌈"];
   rewardEl.textContent = emojis[Math.floor(Math.random() * emojis.length)].repeat(3);
   statusEl.textContent = `Great job! You spelled ${currentWord.toUpperCase()}!`;
+  if (IS_MOBILE && listening && recognition) {
+    listening = false;
+    try { recognition.stop(); } catch (_) {}
+    setListeningUI(false);
+  }
   setTimeout(newWord, 2500);
 }
 
@@ -239,9 +252,14 @@ function setupRecognition() {
   };
 
   recognition.onend = () => {
-    if (listening) {
-      try { recognition.start(); } catch (_) {}
+    if (!listening) return;
+    if (IS_MOBILE) {
+      listening = false;
+      setListeningUI(false);
+      heardEl.textContent = "";
+      return;
     }
+    try { recognition.start(); } catch (_) {}
   };
 }
 
@@ -251,16 +269,25 @@ startBtn.addEventListener("click", () => {
   if (!listening) {
     listening = true;
     try { recognition.start(); } catch (_) {}
-    startBtn.textContent = "Stop";
+    setListeningUI(true);
     if (!currentWord) newWord();
+    if (IS_MOBILE) heardEl.textContent = "Listening…";
   } else {
     listening = false;
     recognition.stop();
-    startBtn.textContent = "Start";
+    setListeningUI(false);
+    if (IS_MOBILE) heardEl.textContent = "";
   }
 });
 
-nextBtn.addEventListener("click", newWord);
+nextBtn.addEventListener("click", () => {
+  if (IS_MOBILE && listening && recognition) {
+    listening = false;
+    try { recognition.stop(); } catch (_) {}
+    setListeningUI(false);
+  }
+  newWord();
+});
 skipBtn.addEventListener("click", () => {
   if (currentIdx < currentWord.length) {
     currentIdx++;
@@ -269,6 +296,7 @@ skipBtn.addEventListener("click", () => {
   }
 });
 
+setListeningUI(false);
 newWord();
 </script>
 </body>
