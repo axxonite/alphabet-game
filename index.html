@@ -178,9 +178,11 @@ function playFanfare() {
 
 function pickWord() {
   if (usedWords.size >= WORDS.length) usedWords.clear();
-  // Pick from earliest unused chunk to maintain scaffolding bias
-  const candidates = WORDS.filter(w => !usedWords.has(w));
-  // Bias toward earlier (simpler) words: pick from first 20% of remaining
+  let candidates = WORDS.filter(w => !usedWords.has(w));
+  // Exhaust all 3-letter words before moving on to 4-letter ones
+  const threes = candidates.filter(w => w.length === 3);
+  if (threes.length) candidates = threes;
+  // Bias toward earlier (simpler) words within the active tier
   const slice = candidates.slice(0, Math.max(5, Math.ceil(candidates.length * 0.3)));
   const w = slice[Math.floor(Math.random() * slice.length)];
   usedWords.add(w);
