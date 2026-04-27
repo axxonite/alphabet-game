@@ -127,9 +127,9 @@ const startBtn = document.getElementById("startBtn");
 const nextBtn = document.getElementById("nextBtn");
 const skipBtn = document.getElementById("skipBtn");
 
-const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-const START_LABEL = IS_MOBILE ? "Listen" : "Start";
-const STOP_LABEL = IS_MOBILE ? "Listening…" : "Stop";
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+const START_LABEL = IS_ANDROID ? "Listen" : "Start";
+const STOP_LABEL = IS_ANDROID ? "Listening…" : "Stop";
 
 let currentWord = "";
 let currentIdx = 0;
@@ -139,6 +139,41 @@ let usedWords = new Set();
 
 function setListeningUI(on) {
   startBtn.textContent = on ? STOP_LABEL : START_LABEL;
+}
+
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  }
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+
+function playTone(ctx, freq, start, dur, type = "triangle", peak = 0.25) {
+  const t0 = ctx.currentTime + start;
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.05);
+}
+
+function playFanfare() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  // C major arpeggio up, then high octave sparkle
+  const notes = [523.25, 659.25, 783.99, 1046.50]; // C5 E5 G5 C6
+  notes.forEach((f, i) => playTone(ctx, f, i * 0.12, 0.35, "triangle", 0.28));
+  // Sparkle on top
+  playTone(ctx, 1568.0, 0.55, 0.5, "sine", 0.18); // G6
+  playTone(ctx, 2093.0, 0.7, 0.6, "sine", 0.15);  // C7
 }
 
 function pickWord() {
@@ -176,7 +211,8 @@ function reward() {
   const emojis = ["⭐","🎉","🌟","🏆","🎊","💖","🦄","🌈"];
   rewardEl.textContent = emojis[Math.floor(Math.random() * emojis.length)].repeat(3);
   statusEl.textContent = `Great job! You spelled ${currentWord.toUpperCase()}!`;
-  if (IS_MOBILE && listening && recognition) {
+  playFanfare();
+  if (IS_ANDROID && listening && recognition) {
     listening = false;
     try { recognition.stop(); } catch (_) {}
     setListeningUI(false);
@@ -253,7 +289,7 @@ function setupRecognition() {
 
   recognition.onend = () => {
     if (!listening) return;
-    if (IS_MOBILE) {
+    if (IS_ANDROID) {
       listening = false;
       setListeningUI(false);
       heardEl.textContent = "";
@@ -264,6 +300,7 @@ function setupRecognition() {
 }
 
 startBtn.addEventListener("click", () => {
+  getAudioCtx(); // unlock audio with this user gesture
   if (!recognition) setupRecognition();
   if (!recognition) return;
   if (!listening) {
@@ -271,17 +308,17 @@ startBtn.addEventListener("click", () => {
     try { recognition.start(); } catch (_) {}
     setListeningUI(true);
     if (!currentWord) newWord();
-    if (IS_MOBILE) heardEl.textContent = "Listening…";
+    if (IS_ANDROID) heardEl.textContent = "Listening…";
   } else {
     listening = false;
     recognition.stop();
     setListeningUI(false);
-    if (IS_MOBILE) heardEl.textContent = "";
+    if (IS_ANDROID) heardEl.textContent = "";
   }
 });
 
 nextBtn.addEventListener("click", () => {
-  if (IS_MOBILE && listening && recognition) {
+  if (IS_ANDROID && listening && recognition) {
     listening = false;
     try { recognition.stop(); } catch (_) {}
     setListeningUI(false);
