@@ -329,7 +329,12 @@ async function initVosk() {
     statusEl.textContent = "Connecting microphone…";
     micStream = await navigator.mediaDevices.getUserMedia({
       video: false,
-      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: true,
+        autoGainControl: false,
+        channelCount: 1,
+      },
     });
     await ctx.audioWorklet.addModule("recognizer-processor.js");
     const node = new AudioWorkletNode(ctx, "recognizer-processor", {
