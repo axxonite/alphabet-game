@@ -314,7 +314,17 @@ async function initVosk() {
 
     const ctx = getAudioCtx();
     const sampleRate = ctx.sampleRate;
-    const recognizer = new model.KaldiRecognizer(sampleRate);
+    // Constrain vocabulary to letter-name pronunciations so Vosk can't drift
+    // to common words like "we" / "and" / "the" instead of V / N / D.
+    const grammar = JSON.stringify([
+      ...new Set(
+        Object.values(LETTER_TOKENS)
+          .flat()
+          .filter(t => /^[a-z ]+$/.test(t)) // drop entries with punctuation
+      ),
+      "[unk]",
+    ]);
+    const recognizer = new model.KaldiRecognizer(sampleRate, grammar);
     recognizer.setWords(true);
     recognizer.on("result", (m) => {
       if (!listening) return;
