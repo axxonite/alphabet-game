@@ -40,7 +40,6 @@
 <div id="controls">
   <button id="startBtn">Start</button>
   <button id="nextBtn" class="secondary">New Word</button>
-  <button id="skipBtn" class="secondary">Skip Letter</button>
 </div>
 
 <script>
@@ -126,7 +125,6 @@ const rewardEl = document.getElementById("reward");
 const progressEl = document.getElementById("progress");
 const startBtn = document.getElementById("startBtn");
 const nextBtn = document.getElementById("nextBtn");
-const skipBtn = document.getElementById("skipBtn");
 
 const MODEL_URL = "models/vosk-model-small-en-us-0.15.tar.gz";
 
@@ -371,13 +369,6 @@ startBtn.addEventListener("click", async () => {
 });
 
 nextBtn.addEventListener("click", newWord);
-skipBtn.addEventListener("click", () => {
-  if (currentIdx < currentWord.length) {
-    currentIdx++;
-    renderWord();
-    if (currentIdx === currentWord.length) reward();
-  }
-});
 
 setListeningUI(false);
 newWord();
