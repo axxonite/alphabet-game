@@ -20,6 +20,8 @@
   .letter.done { color: #2e7d32; }
   #status { font-size: 3vh; color: #555; min-height: 4vh; text-align: center; padding: 0 2vw; }
   #heard { font-size: 2vh; color: #888; min-height: 3vh; font-style: italic; }
+  #engine { font-size: 1.8vh; color: #666; display: flex; gap: 2vw; align-items: center; }
+  #engine label { display: inline-flex; align-items: center; gap: 0.5vw; cursor: pointer; }
   #controls { display: flex; gap: 1vw; }
   button {
     font-size: 2.5vh; padding: 1vh 3vw; border: none; border-radius: 1vh;
@@ -38,6 +40,11 @@
 <div id="word"></div>
 <div id="status">Press Start and say each letter</div>
 <div id="heard"></div>
+<div id="engine">
+  Engine:
+  <label><input type="radio" name="engine" value="vosk"> Vosk (offline)</label>
+  <label><input type="radio" name="engine" value="web"> Web Speech (online)</label>
+</div>
 <div id="controls">
   <button id="startBtn">Start</button>
   <button id="nextBtn" class="secondary">New Word</button>
@@ -317,15 +324,17 @@ let difficulty = parseInt(localStorage.getItem("alphabet-game.difficulty") || "3
 if (!WORD_TIERS[difficulty]) difficulty = 3;
 WORDS = WORD_TIERS[difficulty];
 let listening = false;
-let voskReady = false;
-let voskLoading = false;
-let voskRecognizer = null;
 let audioCtx = null;
 let micStream = null;
+let engine = null; // selected speech engine (set in selectEngine on load)
 let pronunciationMode = localStorage.getItem("alphabet-game.pronunciationMode") || "lenient";
 
 function setListeningUI(on) {
-  startBtn.textContent = on ? "Stop" : "Start";
+  if (engine && engine.isOneShot) {
+    startBtn.textContent = on ? "Listening…" : "Listen";
+  } else {
+    startBtn.textContent = on ? "Stop" : "Start";
+  }
 }
 
 function getAudioCtx() {
@@ -445,102 +454,191 @@ async function downloadWithProgress(url, onProgress) {
   return URL.createObjectURL(blob);
 }
 
-async function initVosk() {
-  if (voskReady || voskLoading) return voskReady;
-  if (typeof Vosk === "undefined") {
-    statusEl.textContent = "Speech library failed to load. Check your connection.";
-    return false;
-  }
-  if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorklet) {
-    statusEl.textContent = "Speech input is not supported in this browser.";
-    return false;
-  }
-  voskLoading = true;
-  startBtn.disabled = true;
-  startBtn.textContent = "Loading…";
-  try {
-    if (!PHONEMES) {
-      statusEl.textContent = "Loading phoneme dictionary…";
-      const dictRes = await fetch("phonemes.json");
-      if (!dictRes.ok) throw new Error(`HTTP ${dictRes.status} fetching phonemes.json`);
-      PHONEMES = await dictRes.json();
+// ---- Engine: Vosk (offline, continuous) ----
+const VoskEngine = {
+  isOneShot: false,
+  ready: false,
+  loading: false,
+  recognizer: null,
+  async init() {
+    if (this.ready || this.loading) return this.ready;
+    if (typeof Vosk === "undefined") {
+      statusEl.textContent = "Speech library failed to load. Check your connection.";
+      return false;
     }
-    statusEl.textContent = "Downloading speech model… 0%";
-    const modelObjectUrl = await downloadWithProgress(MODEL_URL, (pct, mb, totalMb) => {
-      statusEl.textContent = totalMb
-        ? `Downloading speech model… ${pct}% (${mb} / ${totalMb} MB)`
-        : `Downloading speech model… ${mb} MB`;
-    });
-    statusEl.textContent = "Unpacking speech model…";
-    const channel = new MessageChannel();
-    const model = await Vosk.createModel(modelObjectUrl);
-    model.registerPort(channel.port1);
+    if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorklet) {
+      statusEl.textContent = "Speech input is not supported in this browser.";
+      return false;
+    }
+    this.loading = true;
+    startBtn.disabled = true;
+    startBtn.textContent = "Loading…";
+    try {
+      if (!PHONEMES) {
+        statusEl.textContent = "Loading phoneme dictionary…";
+        const dictRes = await fetch("phonemes.json");
+        if (!dictRes.ok) throw new Error(`HTTP ${dictRes.status} fetching phonemes.json`);
+        PHONEMES = await dictRes.json();
+      }
+      statusEl.textContent = "Downloading speech model… 0%";
+      const modelObjectUrl = await downloadWithProgress(MODEL_URL, (pct, mb, totalMb) => {
+        statusEl.textContent = totalMb
+          ? `Downloading speech model… ${pct}% (${mb} / ${totalMb} MB)`
+          : `Downloading speech model… ${mb} MB`;
+      });
+      statusEl.textContent = "Unpacking speech model…";
+      const channel = new MessageChannel();
+      const model = await Vosk.createModel(modelObjectUrl);
+      model.registerPort(channel.port1);
 
-    const ctx = getAudioCtx();
-    const sampleRate = ctx.sampleRate;
-    // Constrain Vosk's vocabulary to words that the phoneme matcher would
-    // accept for *some* letter — narrows recognizer output without us having
-    // to hand-curate the list. Single letter chars + W combo seeds always in.
-    const grammar = JSON.stringify(buildGrammar());
-    const recognizer = new model.KaldiRecognizer(sampleRate, grammar);
-    recognizer.setWords(true);
-    recognizer.on("result", (m) => {
-      if (!listening) return;
-      processTranscript(m.result?.text || "");
-    });
-    recognizer.on("partialresult", (m) => {
-      if (!listening) return;
-      // Letters-only relaxes the matcher so much that B/C/D/E/G/P/T/V/Z all
-      // accept any IY-class word. If we processed partials AND finals, a
-      // single "bee" utterance could advance two letters in a row. Only
-      // act on finalized results in this mode.
-      if (pronunciationMode === "letters-only") return;
-      processTranscript(m.result?.partial || "");
-    });
-    voskRecognizer = recognizer;
+      const ctx = getAudioCtx();
+      const sampleRate = ctx.sampleRate;
+      // Constrain Vosk's vocabulary to words that the phoneme matcher would
+      // accept for *some* letter — narrows recognizer output without us having
+      // to hand-curate the list. Single letter chars + W combo seeds always in.
+      const grammar = JSON.stringify(buildGrammar());
+      const recognizer = new model.KaldiRecognizer(sampleRate, grammar);
+      recognizer.setWords(true);
+      recognizer.on("result", (m) => {
+        if (!listening || engine !== VoskEngine) return;
+        processTranscript(m.result?.text || "");
+      });
+      recognizer.on("partialresult", (m) => {
+        if (!listening || engine !== VoskEngine) return;
+        // Letters-only relaxes the matcher so much that B/C/D/E/G/P/T/V/Z all
+        // accept any IY-class word. If we processed partials AND finals, a
+        // single "bee" utterance could advance two letters in a row. Only
+        // act on finalized results in this mode.
+        if (pronunciationMode === "letters-only") return;
+        processTranscript(m.result?.partial || "");
+      });
+      this.recognizer = recognizer;
 
-    statusEl.textContent = "Connecting microphone…";
-    micStream = await navigator.mediaDevices.getUserMedia({
-      video: false,
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: true,
-        autoGainControl: false,
-        channelCount: 1,
-      },
-    });
-    await ctx.audioWorklet.addModule("recognizer-processor.js");
-    const node = new AudioWorkletNode(ctx, "recognizer-processor", {
-      channelCount: 1, numberOfInputs: 1, numberOfOutputs: 1,
-    });
-    node.port.postMessage({ action: "init", recognizerId: recognizer.id }, [channel.port2]);
-    ctx.createMediaStreamSource(micStream).connect(node);
-    node.connect(ctx.destination);
+      statusEl.textContent = "Connecting microphone…";
+      micStream = await navigator.mediaDevices.getUserMedia({
+        video: false,
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: true,
+          autoGainControl: false,
+          channelCount: 1,
+        },
+      });
+      await ctx.audioWorklet.addModule("recognizer-processor.js");
+      const node = new AudioWorkletNode(ctx, "recognizer-processor", {
+        channelCount: 1, numberOfInputs: 1, numberOfOutputs: 1,
+      });
+      node.port.postMessage({ action: "init", recognizerId: recognizer.id }, [channel.port2]);
+      ctx.createMediaStreamSource(micStream).connect(node);
+      node.connect(ctx.destination);
 
-    voskReady = true;
+      this.ready = true;
+      statusEl.textContent = currentWord
+        ? `Say the letters: ${currentWord.toUpperCase().split("").join(" ")}`
+        : "Ready. Press Start.";
+      return true;
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = `Speech setup failed: ${err.message || err}`;
+      return false;
+    } finally {
+      this.loading = false;
+      startBtn.disabled = false;
+    }
+  },
+  start() { /* worklet always streams; gating is via `listening` */ },
+  stop()  { /* same — leave the audio graph running */ },
+};
+
+// ---- Engine: Web Speech API (online, one-shot per tap) ----
+// Android Chrome ignores continuous=true and plays a system end-tone; we lean
+// into one-shot UX rather than fight it. maxAlternatives=5 + scanning every
+// alternative is the closest thing to phrase biasing the web exposes — if
+// Google returns "eight" as #1 but "H" lower in the list, the matcher catches it.
+const WebSpeechEngine = {
+  isOneShot: true,
+  ready: false,
+  rec: null,
+  async init() {
+    if (this.ready) return true;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      statusEl.textContent = "Web Speech is not supported in this browser.";
+      return false;
+    }
+    const rec = new SR();
+    rec.lang = "en-US";
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.maxAlternatives = 5;
+    rec.onresult = (e) => {
+      if (engine !== WebSpeechEngine) return;
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        for (let a = 0; a < r.length; a++) processTranscript(r[a].transcript);
+      }
+    };
+    rec.onend = () => {
+      if (engine !== WebSpeechEngine) return;
+      listening = false;
+      setListeningUI(false);
+    };
+    rec.onerror = (e) => {
+      if (engine !== WebSpeechEngine) return;
+      if (e.error !== "no-speech" && e.error !== "aborted") {
+        statusEl.textContent = `Speech error: ${e.error}`;
+      }
+    };
+    this.rec = rec;
+    this.ready = true;
     statusEl.textContent = currentWord
       ? `Say the letters: ${currentWord.toUpperCase().split("").join(" ")}`
-      : "Ready. Press Start.";
+      : "Ready. Press Listen.";
     return true;
-  } catch (err) {
-    console.error(err);
-    statusEl.textContent = `Speech setup failed: ${err.message || err}`;
-    return false;
-  } finally {
-    voskLoading = false;
-    startBtn.disabled = false;
+  },
+  start() { try { this.rec.start(); } catch (_) {} },
+  stop()  { try { this.rec.stop();  } catch (_) {} },
+};
+
+const ENGINES = { vosk: VoskEngine, web: WebSpeechEngine };
+
+function selectEngine(name) {
+  if (listening && engine) {
+    engine.stop();
+    listening = false;
   }
+  engine = ENGINES[name] || VoskEngine;
+  localStorage.setItem("engine", name);
+  for (const r of document.querySelectorAll('input[name="engine"]')) {
+    r.checked = (r.value === name);
+  }
+  setListeningUI(false);
 }
+
+document.querySelectorAll('input[name="engine"]').forEach(r => {
+  r.addEventListener("change", () => { if (r.checked) selectEngine(r.value); });
+});
 
 startBtn.addEventListener("click", async () => {
   getAudioCtx();
-  if (!voskReady) {
-    const ok = await initVosk();
+  if (!engine.ready) {
+    const ok = await engine.init();
     if (!ok) return;
   }
-  listening = !listening;
+  if (engine.isOneShot) {
+    if (listening) {
+      engine.stop();
+      listening = false;
+    } else {
+      if (!currentWord) newWord();
+      engine.start();
+      listening = true;
+    }
+  } else {
+    listening = !listening;
+    if (listening && !currentWord) newWord();
+  }
   setListeningUI(listening);
-  if (listening && !currentWord) newWord();
 });
 
 nextBtn.addEventListener("click", newWord);
@@ -559,7 +657,7 @@ modeBtn.addEventListener("click", () => {
   // Grammar (Letters-only vs broad) is fixed at Vosk init. If we just crossed
   // that boundary and Vosk is already running, the change takes effect on reload.
   const isLettersOnly = pronunciationMode === "letters-only";
-  if (voskReady && (wasLettersOnly !== isLettersOnly)) {
+  if (VoskEngine.ready && (wasLettersOnly !== isLettersOnly)) {
     statusEl.textContent = "Reload the page to apply the vocabulary change.";
   }
 });
@@ -580,6 +678,7 @@ difficultyBtn.addEventListener("click", () => {
 });
 renderDifficultyBtn();
 
+selectEngine(localStorage.getItem("engine") || "vosk");
 setListeningUI(false);
 newWord();
 </script>
