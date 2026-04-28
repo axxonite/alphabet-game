@@ -40,6 +40,7 @@
 <div id="controls">
   <button id="startBtn">Start</button>
   <button id="nextBtn" class="secondary">New Word</button>
+  <button id="modeBtn" class="secondary" title="Strict requires a clearer match; Lenient accepts common recognizer confusions (M↔N, B↔P, D↔T)"></button>
 </div>
 
 <script>
@@ -79,42 +80,221 @@ const WORDS = [
   "down","town","loud","gown","foul",
 ];
 
-// ---- Phonetic letter map ----
-// Tokens the speech recognizer may return → which letter they mean.
-const LETTER_TOKENS = {
-  a: ["a","ay","eh","aye"],
-  b: ["b","be","bee","bea","b."],
-  c: ["c","see","sea","cee","si"],
-  d: ["d","de","dee","the"],
-  e: ["e","ee","eee","eh"],
-  f: ["f","ef","eff"],
-  g: ["g","gee","jee"],
-  h: ["h","aitch","haitch","hatch","ache"],
-  i: ["i","eye","aye","i."],
-  j: ["j","jay","jai"],
-  k: ["k","kay","okay","ok"],
-  l: ["l","el","ell"],
-  m: ["m","em","mm"],
-  n: ["n","en","in","an"],
-  o: ["o","oh","owe","ow"],
-  p: ["p","pee","pea","p."],
-  q: ["q","cue","queue","kyu","kew"],
-  r: ["r","are","r.","ar"],
-  s: ["s","es","ess"],
-  t: ["t","tee","tea","te","t."],
-  u: ["u","you","ewe","yu","yew"],
-  v: ["v","vee","ve"],
-  w: ["w","double u","doubleu","double you","doubleyou","dub"],
-  x: ["x","ex","eks","ax","axe"],
-  y: ["y","why","wye"],
-  z: ["z","zee","zed"],
+// ---- Phoneme-based letter matching ----
+// Vosk emits dictionary words. CMU dict gives each word a canonical phoneme
+// sequence. We compare those phonemes against each letter name's known
+// pronunciation, which generalizes across mishearings without enumerating
+// every surface form (H ← "eight"/"ate"/"ace" all fall out of one rule).
+const LETTER_PHONEMES = {
+  a: ["EY"],         b: ["B","IY"],     c: ["S","IY"],     d: ["D","IY"],
+  e: ["IY"],         f: ["EH","F"],     g: ["JH","IY"],    h: ["EY","CH"],
+  i: ["AY"],         j: ["JH","EY"],    k: ["K","EY"],     l: ["EH","L"],
+  m: ["EH","M"],     n: ["EH","N"],     o: ["OW"],         p: ["P","IY"],
+  q: ["K","Y","UW"], r: ["AA","R"],     s: ["EH","S"],     t: ["T","IY"],
+  u: ["Y","UW"],     v: ["V","IY"],     w: ["D","AH","B","AH","L","Y","UW"],
+  x: ["EH","K","S"], y: ["W","AY"],     z: ["Z","IY"],
 };
 
-// Build reverse lookup: token → letter
-const TOKEN_TO_LETTER = {};
-for (const [letter, tokens] of Object.entries(LETTER_TOKENS)) {
-  for (const t of tokens) TOKEN_TO_LETTER[t.toLowerCase()] = letter;
-  TOKEN_TO_LETTER[letter] = letter; // single-char fallback
+// The stressed (loudest) vowel of each letter name — the acoustic anchor.
+const LETTER_STRESS = {
+  a:"EY", b:"IY", c:"IY", d:"IY", e:"IY", f:"EH", g:"IY", h:"EY",
+  i:"AY", j:"EY", k:"EY", l:"EH", m:"EH", n:"EH", o:"OW", p:"IY",
+  q:"UW", r:"AA", s:"EH", t:"IY", u:"UW", v:"IY", w:"UW",
+  x:"EH", y:"AY", z:"IY",
+};
+
+const VOWELS = new Set(["AA","AE","AH","AO","AW","AY","EH","ER","EY","IH","IY","OW","OY","UH","UW"]);
+
+// Vowels that recognizers and kids confuse with each other. AE/EH/AH are
+// notoriously interchangeable; IY/IH likewise. Keep these tight — wider
+// equivalence classes increase false positives.
+const STRESS_EQUIVALENT = {
+  EY: ["EY","EH","AE"],
+  IY: ["IY","IH"],
+  EH: ["EH","AE","AH","IH"],
+  AY: ["AY"],
+  OW: ["OW","AO","AH","UH"],
+  UW: ["UW","UH"],
+  AA: ["AA","AO","AH"],
+};
+
+// For vowel-initial letters that end in a consonant (F/H/L/M/N/S/X), the heard
+// word must contain a phoneme acoustically close to the target's trailing
+// consonant. Without this, every short word starting with EH falsely matches
+// every EH-vowel letter (e.g. "s"→F, bare schwa "a"→F/L/M/N/S/X).
+// CH's class is broad on purpose — H←"eight"/"ate"/"ace" needs T/S/etc.
+const STRICT_TARGET_CONS_EQUIVALENT = {
+  F:  ["F","V"],
+  CH: ["CH","T","JH","D","SH","S","Z","TH","DH"],
+  L:  ["L"],
+  M:  ["M"],
+  N:  ["N","NG"],
+  S:  ["S","Z","SH","ZH","TH"],
+};
+// Lenient mode adds nasal cross-equivalence (M↔N): recognizers routinely
+// swap them on kid speech because they differ only in articulation place.
+const LENIENT_TARGET_CONS_EQUIVALENT = {
+  ...STRICT_TARGET_CONS_EQUIVALENT,
+  M: ["M","N","NG"],
+  N: ["N","M","NG"],
+};
+// Lenient mode also accepts voicing-pair confusions in cons-init letters:
+// kid says B, recognizer often emits "pee" or "p"; same for D↔T.
+const LENIENT_HEARD_CONS_EQUIVALENT = {
+  B: ["B","P"], P: ["P","B"],
+  D: ["D","T"], T: ["T","D"],
+};
+
+// Letters-only mode constrains Vosk's vocabulary to canonical letter names so
+// the decoder is forced to pick a letter for any utterance — no detours through
+// "moon" / "the" / "ham". Trade-off: background noise gets assigned to whichever
+// letter sounds closest, instead of being rejected. Includes H mishearings
+// (eight/ate/ace) because "aitch" isn't in CMU dict and H needs *something*.
+const LETTERS_ONLY_GRAMMAR_WORDS = [
+  "a","ay",
+  "b","be","bee",
+  "c","see","sea","cee",
+  "d","dee",
+  "e","ee",
+  "f",
+  "g","gee","jee",
+  "h","eight","ate","ace","aid","age",
+  "i","eye","aye",
+  "j","jay",
+  "k","kay","okay",
+  "l","el",
+  "m","em",
+  "n","en",
+  "o","oh","owe",
+  "p","pee","pea",
+  "q","cue","queue",
+  "r","are",
+  "s","es","ess",
+  "t","tea","tee",
+  "u","you","ewe",
+  "v","vee","ve",
+  "w","double",
+  "x","ex",
+  "y","why","wye",
+  "z","zee",
+];
+
+// Multi-word tokens that can't be looked up in the phoneme dict — only W has these.
+const W_COMBOS = new Set(["double u", "double you", "doubleu", "doubleyou", "dub"]);
+const TWO_WORD_COMBOS = new Set(["double u", "double you"]);
+
+// Loaded asynchronously from phonemes.json at startup.
+let PHONEMES = null;
+
+function wordPhonemes(word) {
+  const p = PHONEMES?.[word];
+  return p ? p : null;
+}
+
+function matchesExpected(word, expectedLetter) {
+  // Fast path: heard token IS the literal letter character (Vosk can emit "a","b",...).
+  if (word === expectedLetter) return true;
+  // W spoken as "double u" / "double you" comes through as a combined token.
+  if (expectedLetter === "w" && W_COMBOS.has(word)) return true;
+
+  const heard = wordPhonemes(word);
+  if (!heard) return false;
+  const target = LETTER_PHONEMES[expectedLetter];
+  const stressEquiv = STRESS_EQUIVALENT[LETTER_STRESS[expectedLetter]];
+
+  // 1. Stressed-vowel gate: heard must contain the target's stressed vowel
+  //    (or an acoustically close cousin like AE for EH).
+  if (!heard.some(p => stressEquiv.includes(p))) return false;
+
+  // letters-only and lenient share the permissive matcher; only strict tightens.
+  const lenient = pronunciationMode !== "strict";
+  const lettersOnly = pronunciationMode === "letters-only";
+  const targetConsTable = lenient
+    ? LENIENT_TARGET_CONS_EQUIVALENT
+    : STRICT_TARGET_CONS_EQUIVALENT;
+
+  // 2. Onset constraint depends on whether the letter name starts with a consonant.
+  // Letters-only mode skips the *onset* check (so kid's E heard as "bee"
+  // still advances), but the trailing-cons rule below always runs so that
+  // F/L/M/N/S/X stay distinguishable from each other and from A/E/I/O.
+  if (!VOWELS.has(target[0])) {
+    if (!lettersOnly) {
+      // Consonant-initial letter (B/C/D/F/G/J/K/L/M/N/P/Q/R/S/T/V/W/Y/Z):
+      // heard's first consonant must equal the target's. Skip leading vowels
+      // so "okay" [OW,K,EY] still matches K. This is what stops "be" [B,IY]
+      // from falsely matching D — they share IY but onsets differ.
+      const heardFirstCons = heard.find(p => !VOWELS.has(p));
+      const heardEquiv = lenient ? LENIENT_HEARD_CONS_EQUIVALENT[target[0]] : null;
+      const onsetOk = heardEquiv
+        ? heardEquiv.includes(heardFirstCons)
+        : heardFirstCons === target[0];
+      if (!onsetOk) return false;
+    }
+  } else {
+    if (!lettersOnly) {
+      // Vowel-initial letter (A/E/H/I/O/U/X): heard must START with the same
+      // vowel (or stress-equivalent). Stops short consonant-initial words from
+      // matching every vowel-initial letter that happens to share a vowel.
+      if (!stressEquiv.includes(heard[0])) return false;
+    }
+    // Trailing-cons rule (runs in all modes): if target ends in a consonant,
+    // that consonant (or a cousin) must appear in heard. Stops "s"→F,
+    // "a"→F/L/M/N/S/X, and (in letters-only) "el"→M / "ex"→N false positives.
+    const targetCons = target.filter(p => !VOWELS.has(p));
+    if (targetCons.length > 0) {
+      const last = targetCons[targetCons.length - 1];
+      const cousins = targetConsTable[last] || [last];
+      if (!heard.some(p => cousins.includes(p))) return false;
+    }
+  }
+
+  // 3. Length sanity: heard shouldn't dwarf the target.
+  if (heard.length > target.length + 2) return false;
+
+  return true;
+}
+
+function buildGrammar() {
+  // Letters-only mode: hard-bias Vosk to emit a letter name for every utterance.
+  if (pronunciationMode === "letters-only") {
+    const set = new Set(LETTERS_ONLY_GRAMMAR_WORDS);
+    for (let c = 97; c <= 122; c++) set.add(String.fromCharCode(c));
+    return [...set, "[unk]"];
+  }
+  // Strict / Lenient: broad grammar covering every dict word the matcher would
+  // accept for some letter. Always computed under lenient semantics (the wider
+  // set), so toggling Strict↔Lenient at runtime never trips on a missing word.
+  const savedMode = pronunciationMode;
+  pronunciationMode = "lenient";
+  try {
+    const set = new Set();
+    for (let c = 97; c <= 122; c++) set.add(String.fromCharCode(c));
+    set.add("double"); set.add("you"); set.add("u");
+    if (PHONEMES) {
+      const letters = "abcdefghijklmnopqrstuvwxyz";
+      for (const w of Object.keys(PHONEMES)) {
+        for (let i = 0; i < 26; i++) {
+          if (matchesExpected(w, letters[i])) { set.add(w); break; }
+        }
+      }
+    }
+    return [...set, "[unk]"];
+  } finally {
+    pronunciationMode = savedMode;
+  }
+}
+
+function tokenizeWithCombos(cleaned) {
+  const words = cleaned.split(" ");
+  const tokens = [];
+  for (let i = 0; i < words.length; i++) {
+    if (i + 1 < words.length) {
+      const combo = words[i] + " " + words[i + 1];
+      if (TWO_WORD_COMBOS.has(combo)) { tokens.push(combo); i++; continue; }
+    }
+    tokens.push(words[i]);
+  }
+  return tokens;
 }
 
 // ---- DOM ----
@@ -125,6 +305,7 @@ const rewardEl = document.getElementById("reward");
 const progressEl = document.getElementById("progress");
 const startBtn = document.getElementById("startBtn");
 const nextBtn = document.getElementById("nextBtn");
+const modeBtn = document.getElementById("modeBtn");
 
 const MODEL_URL = "models/vosk-model-small-en-us-0.15.tar.gz";
 
@@ -137,6 +318,7 @@ let voskLoading = false;
 let voskRecognizer = null;
 let audioCtx = null;
 let micStream = null;
+let pronunciationMode = localStorage.getItem("alphabet-game.pronunciationMode") || "lenient";
 
 function setListeningUI(on) {
   startBtn.textContent = on ? "Stop" : "Start";
@@ -219,37 +401,13 @@ function reward() {
 
 function processTranscript(text) {
   heardEl.textContent = `Heard: "${text}"`;
-  // Normalize: lowercase, replace punctuation with spaces, collapse spaces
   const cleaned = text.toLowerCase().replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
-  if (!cleaned) return;
+  if (!cleaned || currentIdx >= currentWord.length) return;
 
-  // Try multi-word tokens first (e.g., "double u"), then single words, then chars
-  const words = cleaned.split(" ");
-  const tokens = [];
-  for (let i = 0; i < words.length; i++) {
-    // Try 2-word combo
-    if (i + 1 < words.length) {
-      const combo = words[i] + " " + words[i + 1];
-      if (TOKEN_TO_LETTER[combo]) { tokens.push(combo); i++; continue; }
-    }
-    tokens.push(words[i]);
-  }
-
+  const tokens = tokenizeWithCombos(cleaned);
   for (const tok of tokens) {
     if (currentIdx >= currentWord.length) break;
-    const expected = currentWord[currentIdx];
-    let matched = null;
-
-    if (TOKEN_TO_LETTER[tok]) {
-      matched = TOKEN_TO_LETTER[tok];
-    } else if (tok.length === 1 && /[a-z]/.test(tok)) {
-      matched = tok;
-    } else if (tok.length <= 3 && TOKEN_TO_LETTER[tok[0]]) {
-      // Sometimes recognizer hears "buh" for B — fall back to first char
-      matched = tok[0];
-    }
-
-    if (matched === expected) {
+    if (matchesExpected(tok, currentWord[currentIdx])) {
       currentIdx++;
       renderWord();
       if (currentIdx === currentWord.length) {
@@ -300,8 +458,14 @@ async function initVosk() {
   voskLoading = true;
   startBtn.disabled = true;
   startBtn.textContent = "Loading…";
-  statusEl.textContent = "Downloading speech model… 0%";
   try {
+    if (!PHONEMES) {
+      statusEl.textContent = "Loading phoneme dictionary…";
+      const dictRes = await fetch("phonemes.json");
+      if (!dictRes.ok) throw new Error(`HTTP ${dictRes.status} fetching phonemes.json`);
+      PHONEMES = await dictRes.json();
+    }
+    statusEl.textContent = "Downloading speech model… 0%";
     const modelObjectUrl = await downloadWithProgress(MODEL_URL, (pct, mb, totalMb) => {
       statusEl.textContent = totalMb
         ? `Downloading speech model… ${pct}% (${mb} / ${totalMb} MB)`
@@ -314,16 +478,10 @@ async function initVosk() {
 
     const ctx = getAudioCtx();
     const sampleRate = ctx.sampleRate;
-    // Constrain vocabulary to letter-name pronunciations so Vosk can't drift
-    // to common words like "we" / "and" / "the" instead of V / N / D.
-    const grammar = JSON.stringify([
-      ...new Set(
-        Object.values(LETTER_TOKENS)
-          .flat()
-          .filter(t => /^[a-z ]+$/.test(t)) // drop entries with punctuation
-      ),
-      "[unk]",
-    ]);
+    // Constrain Vosk's vocabulary to words that the phoneme matcher would
+    // accept for *some* letter — narrows recognizer output without us having
+    // to hand-curate the list. Single letter chars + W combo seeds always in.
+    const grammar = JSON.stringify(buildGrammar());
     const recognizer = new model.KaldiRecognizer(sampleRate, grammar);
     recognizer.setWords(true);
     recognizer.on("result", (m) => {
@@ -332,6 +490,11 @@ async function initVosk() {
     });
     recognizer.on("partialresult", (m) => {
       if (!listening) return;
+      // Letters-only relaxes the matcher so much that B/C/D/E/G/P/T/V/Z all
+      // accept any IY-class word. If we processed partials AND finals, a
+      // single "bee" utterance could advance two letters in a row. Only
+      // act on finalized results in this mode.
+      if (pronunciationMode === "letters-only") return;
       processTranscript(m.result?.partial || "");
     });
     voskRecognizer = recognizer;
@@ -381,6 +544,26 @@ startBtn.addEventListener("click", async () => {
 });
 
 nextBtn.addEventListener("click", newWord);
+
+const MODE_CYCLE = ["lenient", "strict", "letters-only"];
+const MODE_LABEL = { "lenient": "Lenient", "strict": "Strict", "letters-only": "Letters-only" };
+function renderModeBtn() {
+  modeBtn.textContent = MODE_LABEL[pronunciationMode] || "Lenient";
+}
+modeBtn.addEventListener("click", () => {
+  const wasLettersOnly = pronunciationMode === "letters-only";
+  const idx = MODE_CYCLE.indexOf(pronunciationMode);
+  pronunciationMode = MODE_CYCLE[(idx + 1) % MODE_CYCLE.length];
+  localStorage.setItem("alphabet-game.pronunciationMode", pronunciationMode);
+  renderModeBtn();
+  // Grammar (Letters-only vs broad) is fixed at Vosk init. If we just crossed
+  // that boundary and Vosk is already running, the change takes effect on reload.
+  const isLettersOnly = pronunciationMode === "letters-only";
+  if (voskReady && (wasLettersOnly !== isLettersOnly)) {
+    statusEl.textContent = "Reload the page to apply the vocabulary change.";
+  }
+});
+renderModeBtn();
 
 setListeningUI(false);
 newWord();
