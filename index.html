@@ -9,7 +9,8 @@
   body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4vh; }
   #word { display: flex; gap: 2vw; max-width: 96vw; justify-content: center; }
   .letter {
-    font-size: min(22vh, 18vw);
+    /* Scales by --letter-count (set per-render) so 7-letter words fit one line. */
+    font-size: min(22vh, calc(85vw / var(--letter-count, 3) - 2vw));
     font-weight: 700;
     text-transform: uppercase;
     color: #bbb;
@@ -40,45 +41,44 @@
 <div id="controls">
   <button id="startBtn">Start</button>
   <button id="nextBtn" class="secondary">New Word</button>
-  <button id="modeBtn" class="secondary" title="Strict requires a clearer match; Lenient accepts common recognizer confusions (M↔N, B↔P, D↔T)"></button>
+  <button id="modeBtn" class="secondary" title="Strict requires a clearer match; Lenient accepts common recognizer confusions (M↔N, B↔P, D↔T); Letters-only locks Vosk to letter homophones"></button>
+  <button id="difficultyBtn" class="secondary" title="Word length: 3 / 5 / 7 letters"></button>
 </div>
 
 <script>
-// ---- Word list: scaffolded by vowel sound ----
-// 3-letter short vowels first, then 4-letter long vowels & diphthongs.
-// Similar vowel sounds are adjacent.
-const WORDS = [
-  // short a
-  "cat","bat","hat","map","cap","bag","ham","jam","ran","dad","van","fan",
-  // long a (silent e)
-  "cake","lake","gate","name","game",
-  // long a (ai/ay)
-  "rain","mail","tail","pain","tray",
-  // short e
-  "bed","red","hen","pen","ten","leg","web","jet","yes","get",
-  // long e (ee)
-  "feet","tree","seed","beep","peek",
-  // long e (ea)
-  "leaf","read","beam","team","meat",
-  // short i
-  "pig","big","sit","hit","pin","win","tip","kid","lip","fix",
-  // long i (silent e)
-  "bike","kite","time","ride","hide",
-  // short o
-  "dog","log","hot","pot","top","box","fox","hop","mom","mop",
-  // long o (silent e)
-  "bone","home","rope","nose","joke",
-  // long o (oa)
-  "boat","road","soap","coat","goat",
-  // short u
-  "cup","sun","run","bus","mud","hug","bug","nut",
-  // long u (oo)
-  "moon","food","room","pool","boot",
-  // diphthong oi/oy
-  "coin","boil","join","toys","soil",
-  // diphthong ow/ou
-  "down","town","loud","gown","foul",
-];
+// ---- Word lists by difficulty (length) ----
+// Each tier holds words of exactly that length. Difficulty setting picks tier.
+const WORD_TIERS = {
+  3: [
+    // short a
+    "cat","bat","hat","map","cap","bag","ham","jam","ran","dad","van","fan",
+    // short e
+    "bed","red","hen","pen","ten","leg","web","jet","yes","get",
+    // short i
+    "pig","big","sit","hit","pin","win","tip","kid","lip","fix",
+    // short o
+    "dog","log","hot","pot","top","box","fox","hop","mom","mop",
+    // short u
+    "cup","sun","run","bus","mud","hug","bug","nut",
+  ],
+  5: [
+    "apple","happy","smile","water","bread","house","mouse","plant","table","chair",
+    "beach","light","music","party","stone","snake","tiger","lemon","sugar","candy",
+    "jelly","sweet","tooth","brush","paint","dance","magic","story","truck","train",
+    "horse","pizza","sleep","green","black","white","brown","cloud","grass","berry",
+    "dream","skate","crown","queen","tower","fairy","robot","clown","cream",
+  ],
+  7: [
+    "rainbow","dolphin","penguin","balloon","kitchen","cookies","monkeys","country",
+    "history","bicycle","holiday","flowers","animals","freedom","kingdom","picture",
+    "popcorn","sandbox","sunbeam","bedroom","weekend","morning","evening","library",
+    "octopus","pumpkin","unicorn","rockets","village","blanket","sandals","cupcake",
+    "diamond","emerald","sausage","biscuit","captain","journey","mystery","perfume",
+  ],
+};
+// Compatibility: a few code paths reference WORDS directly. Keep it pointed at
+// the active tier (set inside setDifficulty).
+let WORDS = WORD_TIERS[3];
 
 // ---- Phoneme-based letter matching ----
 // Vosk emits dictionary words. CMU dict gives each word a canonical phoneme
@@ -306,12 +306,16 @@ const progressEl = document.getElementById("progress");
 const startBtn = document.getElementById("startBtn");
 const nextBtn = document.getElementById("nextBtn");
 const modeBtn = document.getElementById("modeBtn");
+const difficultyBtn = document.getElementById("difficultyBtn");
 
 const MODEL_URL = "models/vosk-model-small-en-us-0.15.tar.gz";
 
 let currentWord = "";
 let currentIdx = 0;
 let usedWords = new Set();
+let difficulty = parseInt(localStorage.getItem("alphabet-game.difficulty") || "3", 10);
+if (!WORD_TIERS[difficulty]) difficulty = 3;
+WORDS = WORD_TIERS[difficulty];
 let listening = false;
 let voskReady = false;
 let voskLoading = false;
@@ -360,19 +364,15 @@ function playFanfare() {
 
 function pickWord() {
   if (usedWords.size >= WORDS.length) usedWords.clear();
-  let candidates = WORDS.filter(w => !usedWords.has(w));
-  // Exhaust all 3-letter words before moving on to 4-letter ones
-  const threes = candidates.filter(w => w.length === 3);
-  if (threes.length) candidates = threes;
-  // Bias toward earlier (simpler) words within the active tier
-  const slice = candidates.slice(0, Math.max(5, Math.ceil(candidates.length * 0.3)));
-  const w = slice[Math.floor(Math.random() * slice.length)];
+  const candidates = WORDS.filter(w => !usedWords.has(w));
+  const w = candidates[Math.floor(Math.random() * candidates.length)];
   usedWords.add(w);
   return w;
 }
 
 function renderWord() {
   wordEl.innerHTML = "";
+  wordEl.style.setProperty("--letter-count", currentWord.length);
   for (let i = 0; i < currentWord.length; i++) {
     const span = document.createElement("span");
     span.className = "letter" + (i < currentIdx ? " done" : i === currentIdx ? " current" : "");
@@ -564,6 +564,21 @@ modeBtn.addEventListener("click", () => {
   }
 });
 renderModeBtn();
+
+const DIFFICULTY_CYCLE = [3, 5, 7];
+function renderDifficultyBtn() {
+  difficultyBtn.textContent = `${difficulty}-letter`;
+}
+difficultyBtn.addEventListener("click", () => {
+  const idx = DIFFICULTY_CYCLE.indexOf(difficulty);
+  difficulty = DIFFICULTY_CYCLE[(idx + 1) % DIFFICULTY_CYCLE.length];
+  localStorage.setItem("alphabet-game.difficulty", String(difficulty));
+  WORDS = WORD_TIERS[difficulty];
+  usedWords.clear();
+  renderDifficultyBtn();
+  newWord();
+});
+renderDifficultyBtn();
 
 setListeningUI(false);
 newWord();
